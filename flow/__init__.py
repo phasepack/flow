@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, List
 
 
 class Var:
@@ -12,101 +12,112 @@ class Var:
 
 
 class Tape:
-    def __init__(self, var):
-        self.var = var
-        self.value = None
-        self.previous_value = None
-        self.history = None
-
-    def track(self):
-        if not self.history:
-            self.history = []
+    def __init__(self, loop):
+        self.loop = loop
+        self.histories = {}
+        self.counter = 0
 
     def __getitem__(self, key):
-        if key == (-1,):
-            return self.previous_value
+        var = key[0]
+        index = key[1]
+        return self.histories[var][index]
 
-        return self.history[key]
-
-    def advance(self):
-        self.previous_value = self.value
-
-        if self.history is not None:
-            self.history.append(self.value)
-
-        self.value = None
+    def __setitem__(self, var, value):
+        if var not in self.histories:
+            self.histories[var] = []
+        self.histories[var].append(value)
 
     def __str__(self):
-        return "  {} -> {}".format(self.var.name, self.value)
+        s = "Tape[ n = {} \n".format(self.counter)
+        for var, history in self.histories.items():
+            s += "    " + var.name + " => " + ", ".join(map(str, history)) + "\n"
+        return s + "]"
+
+    def advance(self, values):
+        self.counter += 1
+        for var in self.loop.vars:
+            if var in values:
+                self[var] = values[var]
 
 
 class State:
-    """A state of the flow network, which contains definitions for all the variables."""
     def __init__(self):
+        self.values = {}
         self.tapes = {}
 
-    def __getitem__(self, key):
-        if isinstance(key, Var):
-            if key in self.tapes:
-                return self.tapes[key].value
-            else:
-                raise ValueError("state does not contain tape for variable '{}'".format(key.name))
-        elif isinstance(key, tuple):
-            var = key[0]
-            if var in self.tapes:
-                key = key[1:]
-                return self.tapes[var][key]
-            else:
-                raise ValueError("state does not contain tape for variable '{}'".format(var.name))
+    def __getitem__(self, var):
+        return self.values[var]
 
-    def __setitem__(self, key: Var, value):
-        if key not in self.tapes:
-            self.tapes[key] = Tape(key)
+    def __setitem__(self, var, value):
+        self.values[var] = value
 
-        self.tapes[key].value = value
+    def __delitem__(self, var):
+        del self.values[var]
 
-    def __delitem__(self, key: Var):
-        if key in self.tapes:
-            del self.tapes[key]
-        else:
-            raise ValueError("state does not contain tape for variable '{}'".format(key.name))
+    def push_loop(self, loop):
+        self.tapes[loop] = Tape(loop)
+
+    def pop_loop(self, loop):
+        del self.tapes[loop]
+
+    def advance(self, loop):
+        self.tapes[loop].advance(self.values)
 
     def __str__(self):
-        desc = "state variables:\n"
-        for tape in self.tapes:
-            desc += tape
-        return desc
+        s = "State[\n"
+        for var in self.values:
+            s += "    " + var.name + " => " + str(self.values[var]) + "\n"
+        for tape in self.tapes.values():
+            s += str(tape) + "\n"
+        return s + "]"
 
 
 class Flow:
-    def __init__(self, flow_function: Callable[[Dict, Dict, State], None], track=None):
-        self.flow_function = flow_function
-        self.track = track
+    def __init__(self, flow_op: Callable[[Dict, Dict, State], None]):
+        self.flow_op = flow_op
 
-    def __call__(self, state: State):
-        if self.track:
-            for var in self.track:
-                state.tapes[var].track()
-
-        self.flow_function(inputs, options, state)
+    def operate(self, inputs, options, state):
+        self.flow_op(inputs, options, state)
 
     def __rshift__(self, other: "Flow") -> "Flow":
-        if isinstance(other, Flow):
-            def chain(state):
-                self.flow_function(state)
-                other.flow_function(state)
-            return Flow(chain)
-        else:
-            raise ValueError("flows can only be combined with other flows")
+        def chain(inputs, options, state):
+            self.operate(inputs, options, state)
+            other.operate(inputs, options, state)
+        return Flow(chain)
 
 
-def flow():
-    def wrap(flow_function: Callable[[Any, Any, State], None]) -> Flow:
-        return Flow(flow_function)
-    return wrap
+def test_condition(state):
+    condition = state[CONDITION]
+    del state[CONDITION]
+    return condition
+
+
+class Loop(Flow):
+    def __init__(self, body_flow: Flow, condition_flow: Flow, loop_vars: List[Var]):
+        self.body_flow = body_flow
+        self.condition_flow = condition_flow
+        self.vars = loop_vars
+
+        def flow_op(inputs, options, state):
+            state.push_loop(self)
+            self.condition_flow.operate(inputs, options, state)
+
+            while test_condition(state):
+                state.advance(self)
+                self.body_flow.operate(inputs, options, state)
+                self.condition_flow.operate(inputs, options, state)
+
+            state.pop_loop(self)
+
+        super(Loop, self).__init__(flow_op)
+
+
+def flow(flow_op: Callable[[Dict, Dict, State], None]) -> Flow:
+    return Flow(flow_op)
 
 
 CONDITION = Var('?', """The condition supplied to switches and loops.""")
+LOOP_COUNTER = Var('#', """The number of iterations in a loop.""")
 
 
 def switch(yes: Flow, no: Flow=None) -> Flow:
@@ -117,34 +128,8 @@ def switch(yes: Flow, no: Flow=None) -> Flow:
 
         if condition:
             if yes:
-                yes(inputs, options, state)
+                yes.operate(inputs, options, state)
         else:
             if no:
-                no(inputs, options, state)
-    return Flow(check)
-
-
-def loop(conditioner: Flow, body: Flow, advance=None, track=None) -> Flow:
-    def check(inputs, options, state):
-        while True:
-            if track:
-                for var in track:
-                    if var in state.tapes:
-                        state.tapes[var].track()
-
-            conditioner(inputs, options, state)
-
-            # Check the condition that was passed in
-            condition = state[CONDITION]
-            del state[CONDITION]
-
-            if condition:
-                if advance:
-                    for var in advance:
-                        if var in state.tapes:
-                            state.tapes[var].advance()
-
-                body(inputs, options, state)
-            else:
-                break
+                no.operate(inputs, options, state)
     return Flow(check)
