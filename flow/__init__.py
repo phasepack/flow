@@ -28,15 +28,18 @@ class Tape:
             self.histories[var] = []
         self.histories[var].append(value)
 
+    def __contains__(self, var):
+        return var in self.histories
+
     def __str__(self):
         s = "Tape[ n = {} \n".format(self.counter)
         for var, history in self.histories.items():
             s += "    " + var.name + " => " + ", ".join(map(str, history)) + "\n"
         return s + "]"
 
-    def advance(self, values):
+    def advance(self, values, only_vars: List[vars]=None):
         self.counter += 1
-        for var in self.loop.vars:
+        for var in only_vars if only_vars is not None else self.loop.vars:
             if var in values:
                 self[var] = values[var]
 
@@ -73,6 +76,9 @@ class State:
     def __delitem__(self, var):
         del self.values[var]
 
+    def __contains__(self, var):
+        return var in self.values
+
     def push_loop(self, loop):
         self.loop_stack.append(loop)
         self.tapes[loop] = Tape(loop)
@@ -84,8 +90,8 @@ class State:
         if loop.save:
             self.saved_tapes[tape.loop] = tape
 
-    def advance(self, loop):
-        self.tapes[loop].advance(self.values)
+    def advance(self, loop, only_vars: List[Var]=None):
+        self.tapes[loop].advance(self.values, only_vars)
 
     def __str__(self):
         s = "State[\n"
@@ -120,7 +126,8 @@ def test_condition(state):
 
 
 class Loop(Flow):
-    def __init__(self, body_flow: Flow, condition_flow: Flow, loop_vars: List[Var], save: bool=False):
+    def __init__(self, body_flow: Flow, condition_flow: Flow, loop_vars: List[Var], save: bool=False,
+                 check_first: bool=True, initial_vars: List[Var]=None):
         self.body_flow = body_flow
         self.condition_flow = condition_flow
         self.vars = loop_vars
@@ -128,13 +135,22 @@ class Loop(Flow):
 
         def flow_op(inputs, state):
             state.push_loop(self)
-            state.advance(self)
-            self.condition_flow.operate(inputs, state)
 
-            while test_condition(state):
-                self.body_flow.operate(inputs, state)
+            # Advance the initial variables (if any)
+            state.advance(self, initial_vars)
+
+            stop = False
+
+            # Check before the first iteration
+            if check_first:
                 self.condition_flow.operate(inputs, state)
+                stop = test_condition(state)
+
+            while not stop:
+                self.body_flow.operate(inputs, state)
                 state.advance(self)
+                self.condition_flow.operate(inputs, state)
+                stop = test_condition(state)
 
             state.pop_loop()
 
@@ -158,10 +174,9 @@ TIME = Var('t', """The system time.""")
 
 
 def time(f):
-    def timed_flow(inp, state):
-        f.operate(inp, state)
+    def timer_flow(inp, state):
         state[TIME] = _time()
-    return Flow(timed_flow)
+    return f >> Flow(timer_flow)
 
 
 CONDITION = Var('?', """The condition supplied to switches and loops.""")
