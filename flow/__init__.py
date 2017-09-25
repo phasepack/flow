@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 from time import time as _time
 
 
@@ -9,14 +9,14 @@ class Var:
         self.docs = docs
 
     def __repr__(self):
-        return "<flow.Var : {}>".format(self.name)
+        return "<flow.Var: '{}'>".format(self.name)
 
 
 class Tape:
-    def __init__(self, loop):
+    def __init__(self, state, loop):
+        self.state = state
         self.loop = loop
         self.histories = {}
-        self.counter = 0
 
     def __getitem__(self, key):
         var = key[0]
@@ -32,43 +32,41 @@ class Tape:
         return var in self.histories
 
     def __str__(self):
-        s = "Tape[ n = {} \n".format(self.counter)
+        s = "Tape[ n = {} \n".format(self.state[self.loop.counter])
         for var, history in self.histories.items():
             s += "    " + var.name + " => " + ", ".join(map(str, history)) + "\n"
         return s + "]"
 
-    def advance(self, values, only_vars: List[vars]=None):
-        self.counter += 1
+    def advance(self, only_vars: List[vars]=None):
+        self.state[self.loop.counter] += 1
         for var in only_vars if only_vars is not None else self.loop.vars:
-            if var in values:
-                self[var] = values[var]
+            if var in self.state.values:
+                self[var] = self.state.values[var]
 
 
 class State:
     def __init__(self):
         self.values = {}
-        self.loop_stack = []
+        self.loops = []
         self.tapes = {}
         self.saved_tapes = {}
-
-    def get_tape(self, key):
-        if isinstance(key, int):
-            key = self.loop_stack[key]
-        return self.tapes[key]
 
     def __getitem__(self, key):
         if isinstance(key, Var):
             return self.values[key]
         elif isinstance(key, tuple):
             if len(key) == 3:
-                loop = key[0]
+                if isinstance(key[0], Loop):
+                    loop = key[0]
+                else:
+                    loop = self.loops[key[0]]
                 var = key[1]
                 index = key[2]
             else:
-                loop = -1
+                loop = self.loops[-1]
                 var = key[0]
                 index = key[1]
-            return self.get_tape(loop)[var,index]
+            return self.tapes[loop][var,index]
 
     def __setitem__(self, var, value):
         self.values[var] = value
@@ -80,30 +78,31 @@ class State:
         return var in self.values
 
     def push_loop(self, loop):
-        self.loop_stack.append(loop)
-        self.tapes[loop] = Tape(loop)
+        self.loops.append(loop)
+        self.tapes[loop] = Tape(self, loop)
+        self.values[loop.counter] = -1
 
     def pop_loop(self):
-        loop = self.loop_stack.pop()
-        tape = self.tapes[loop]
-        del self.tapes[loop]
-        if loop.save:
-            self.saved_tapes[tape.loop] = tape
+        loop = self.loops.pop()
+        if not loop.save:
+            del self.tapes[loop]
+            del self[loop.counter]
 
     def advance(self, loop, only_vars: List[Var]=None):
-        self.tapes[loop].advance(self.values, only_vars)
+        self.tapes[loop].advance(only_vars=only_vars)
 
     def __str__(self):
         s = "State[\n"
         for var in self.values:
             s += "    " + var.name + " => " + str(self.values[var]) + "\n"
-        for loop in self.loop_stack:
+        for loop in self.loops:
             s += str(self.tapes[loop]) + "\n"
         return s + "]"
 
 
 class Flow:
-    def __init__(self, flow_op: Callable[[Dict, State], None]):
+    def __init__(self, name: str, flow_op: Callable[[Dict, State], None]):
+        self.name = name
         self.flow_op = flow_op
 
     def operate(self, inputs, state):
@@ -116,7 +115,13 @@ class Flow:
         def chain(inputs, state):
             self.operate(inputs, state)
             other.operate(inputs, state)
-        return Flow(chain)
+        return Flow("{} -> {}".format(self.name, other.name), chain)
+
+    def __lshift__(self, other):
+        return other >> self
+
+    def __repr__(self):
+        return "<flow.Flow: '{}'>".format(self.name)
 
 
 def test_condition(state):
@@ -126,57 +131,58 @@ def test_condition(state):
 
 
 class Loop(Flow):
-    def __init__(self, body_flow: Flow, condition_flow: Flow, loop_vars: List[Var], save: bool=False,
+    def __init__(self, body_flow: Flow, condition_flow: Flow, loop_vars: List[Var]=[], save: bool=False,
                  check_first: bool=True, initial_vars: List[Var]=None):
         self.body_flow = body_flow
         self.condition_flow = condition_flow
         self.vars = loop_vars
         self.save = save
+        self.counter = Var('counter', "A loop counter.")
 
         def flow_op(inputs, state):
             state.push_loop(self)
 
             # Advance the initial variables (if any)
-            state.advance(self, initial_vars)
+            state.advance(self, only_vars=initial_vars)
 
             stop = False
 
             # Check before the first iteration
             if check_first:
                 self.condition_flow.operate(inputs, state)
-                stop = test_condition(state)
+                stop = not test_condition(state)
 
             while not stop:
                 self.body_flow.operate(inputs, state)
                 state.advance(self)
                 self.condition_flow.operate(inputs, state)
-                stop = test_condition(state)
+                stop = not test_condition(state)
 
             state.pop_loop()
 
-        super(Loop, self).__init__(flow_op)
+        super(Loop, self).__init__("Loop[{}? => {}]".format(condition_flow.name, body_flow.name), flow_op)
 
 
 def flow(flow_op: Callable[[Dict, State], None]) -> Flow:
-    return Flow(flow_op)
-
-# Useful flow decorators
+    return Flow(flow_op.__name__, flow_op)
 
 
+# Useful flows
 def inspect(f):
-    def inspected_flow(inp, state):
+    """Prints the state before any given flow (useful for debugging)."""
+    def inspector_flow(inputs, state):
         print(str(state))
-        f.operate(inp, state)
-    return Flow(inspected_flow)
+    return Flow("inspector", inspector_flow) >> f
 
 
 TIME = Var('t', """The system time.""")
 
 
 def time(f):
-    def timer_flow(inp, state):
+    """Records the time after any given flow."""
+    def timer_flow(inputs, state):
         state[TIME] = _time()
-    return f >> Flow(timer_flow)
+    return f >> Flow("timer", timer_flow)
 
 
 CONDITION = Var('?', """The condition supplied to switches and loops.""")
@@ -195,17 +201,3 @@ def switch(yes: Flow, no: Flow=None) -> Flow:
             if no:
                 no.operate(inputs, state)
     return Flow(check)
-
-
-#
-# # Backtracking
-# M = flow.Var('M', "The maximum value of f over the last several iterations.")
-#
-# @flow
-# def backtracking_condition(inp, state):
-#     state[flow.CONDITION] = state[f] - \
-#                             (state[M] + np.real(state[Dx].ravel().T @ state[gradf, -1].ravel()) + la.norm(state[Dx].ravel()) ** 2 / (2 * state[tau, -1])) > inp['EPSILON']
-#
-# @flow
-# def backtracking_window_estimator(inp, state):
-#     state[M] =
